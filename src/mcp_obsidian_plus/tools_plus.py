@@ -2,7 +2,7 @@
 
 These are additive to the upstream tools in tools.py — new capabilities that
 were missing: server info, active file, execute command, file metadata,
-recursive listing, plugin management, health check.
+recursive listing, plugin management, health check, knowledge ops, file ops.
 """
 from collections.abc import Sequence
 import json
@@ -10,7 +10,7 @@ import os
 import re
 from mcp.types import Tool, TextContent, ImageContent, EmbeddedResource
 
-from . import obsidian
+from . import obsidian, knowledge, file_ops
 from .tools import ToolHandler, api_key, obsidian_host
 
 
@@ -392,3 +392,327 @@ class ListPluginsToolHandler(ToolHandler):
         except Exception as e:
             result["installed_dirs_error"] = str(e)
         return [TextContent(type="text", text=_json(result))]
+
+
+class TogglePluginToolHandler(ToolHandler):
+    def __init__(self):
+        super().__init__("obsidian_toggle_plugin")
+
+    def get_tool_description(self):
+        return Tool(
+            name=self.name,
+            description=(
+                "Enable or disable a community plugin. Edits "
+                "`.obsidian/community-plugins.json` (the list of enabled plugin ids) "
+                "and then triggers `app:reload` so the change takes effect. "
+                "Plugin files must already be present in `.obsidian/plugins/<id>/`."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "plugin_id": {"type": "string", "description": "Plugin id (e.g. 'dataview')"},
+                    "enable": {"type": "boolean", "description": "True = add to enabled list; False = remove"},
+                    "reload_app": {"type": "boolean", "description": "Run app:reload after edit (default: true)", "default": True},
+                },
+                "required": ["plugin_id", "enable"],
+            },
+        )
+
+    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        if "plugin_id" not in args or "enable" not in args:
+            raise RuntimeError("plugin_id and enable required")
+        api = _client()
+        enabled_path = ".obsidian/community-plugins.json"
+        try:
+            raw = api.get_file_contents(enabled_path)
+            current = json.loads(raw) if raw.strip() else []
+        except Exception:
+            current = []
+        if not isinstance(current, list):
+            current = []
+
+        plugin_id = args["plugin_id"]
+        enable = bool(args["enable"])
+        before = list(current)
+        if enable and plugin_id not in current:
+            current.append(plugin_id)
+        elif not enable and plugin_id in current:
+            current.remove(plugin_id)
+
+        new_content = json.dumps(current, indent=2, ensure_ascii=False)
+        api.put_content(enabled_path, new_content)
+
+        reloaded = False
+        if args.get("reload_app", True):
+            try:
+                api.execute_command("app:reload")
+                reloaded = True
+            except Exception as e:
+                return [TextContent(type="text", text=_json({
+                    "plugin_id": plugin_id, "enable": enable, "before": before, "after": current,
+                    "reload_error": str(e),
+                }))]
+        return [TextContent(type="text", text=_json({
+            "plugin_id": plugin_id, "enable": enable, "before": before, "after": current, "reloaded": reloaded,
+        }))]
+
+
+# ── Knowledge ops ────────────────────────────────────────────────────────
+
+class AddTagsToolHandler(ToolHandler):
+    def __init__(self):
+        super().__init__("obsidian_add_tags")
+
+    def get_tool_description(self):
+        return Tool(
+            name=self.name,
+            description=(
+                "Add tags to a file's YAML frontmatter. Creates the frontmatter block if missing. "
+                "Tags are deduplicated. Accepts tags with or without leading '#'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filepath": {"type": "string", "format": "path"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "e.g. ['security', '#portfolio']"},
+                },
+                "required": ["filepath", "tags"],
+            },
+        )
+
+    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        if "filepath" not in args or "tags" not in args:
+            raise RuntimeError("filepath and tags required")
+        report = knowledge.add_tags(_client(), args["filepath"], args["tags"])
+        return [TextContent(type="text", text=_json(report))]
+
+
+class RemoveTagsToolHandler(ToolHandler):
+    def __init__(self):
+        super().__init__("obsidian_remove_tags")
+
+    def get_tool_description(self):
+        return Tool(
+            name=self.name,
+            description="Remove tags from a file's YAML frontmatter. No-op if tag absent.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filepath": {"type": "string", "format": "path"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["filepath", "tags"],
+            },
+        )
+
+    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        if "filepath" not in args or "tags" not in args:
+            raise RuntimeError("filepath and tags required")
+        report = knowledge.remove_tags(_client(), args["filepath"], args["tags"])
+        return [TextContent(type="text", text=_json(report))]
+
+
+class FindBacklinksToolHandler(ToolHandler):
+    def __init__(self):
+        super().__init__("obsidian_find_backlinks")
+
+    def get_tool_description(self):
+        return Tool(
+            name=self.name,
+            description=(
+                "Find all files containing a wikilink to `target`. Matches "
+                "`[[target]]`, `[[target.md]]`, `[[target|alias]]`, `[[target#heading]]`."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "Target path or name (with or without .md)"}
+                },
+                "required": ["target"],
+            },
+        )
+
+    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        if "target" not in args:
+            raise RuntimeError("target required")
+        results = knowledge.find_backlinks(_client(), args["target"])
+        return [TextContent(type="text", text=_json({"count": len(results), "results": results}))]
+
+
+class RefactorLinksToolHandler(ToolHandler):
+    def __init__(self):
+        super().__init__("obsidian_refactor_links")
+
+    def get_tool_description(self):
+        return Tool(
+            name=self.name,
+            description=(
+                "Replace all `[[old_path]]` with `[[new_path]]` across the vault. "
+                "Preserves aliases and heading suffixes (e.g. `[[old|alias]]` → `[[new|alias]]`). "
+                "Use dry_run=true to preview changes without writing."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "old_path": {"type": "string"},
+                    "new_path": {"type": "string"},
+                    "dry_run": {"type": "boolean", "default": False},
+                },
+                "required": ["old_path", "new_path"],
+            },
+        )
+
+    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        if "old_path" not in args or "new_path" not in args:
+            raise RuntimeError("old_path and new_path required")
+        report = knowledge.refactor_links(
+            _client(),
+            args["old_path"],
+            args["new_path"],
+            dry_run=bool(args.get("dry_run", False)),
+        )
+        return [TextContent(type="text", text=_json(report))]
+
+
+class GenerateMocToolHandler(ToolHandler):
+    def __init__(self):
+        super().__init__("obsidian_generate_moc")
+
+    def get_tool_description(self):
+        return Tool(
+            name=self.name,
+            description=(
+                "Generate a Map of Content markdown file listing all notes in `folder`, "
+                "grouped by immediate subfolder. If out_path is provided, writes the MoC there; "
+                "otherwise returns the content in the response."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "folder": {"type": "string", "description": "Folder to index (empty = vault root)"},
+                    "title": {"type": "string", "description": "Heading for the MoC (default: auto)"},
+                    "include_subfolders": {"type": "boolean", "default": True},
+                    "out_path": {"type": "string", "description": "Where to write the MoC (optional)"},
+                },
+                "required": ["folder"],
+            },
+        )
+
+    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        report = knowledge.generate_moc(
+            _client(),
+            args.get("folder", ""),
+            title=args.get("title", ""),
+            include_subfolders=bool(args.get("include_subfolders", True)),
+            out_path=args.get("out_path"),
+        )
+        return [TextContent(type="text", text=_json(report))]
+
+
+# ── File ops ─────────────────────────────────────────────────────────────
+
+class RenameFileToolHandler(ToolHandler):
+    def __init__(self):
+        super().__init__("obsidian_rename_file")
+
+    def get_tool_description(self):
+        return Tool(
+            name=self.name,
+            description=(
+                "Rename a file: copy to new path, optionally rewrite backlinks, delete old. "
+                "Not transactional — if backlink refactor fails mid-way, leaves files in inconsistent state."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "from_path": {"type": "string"},
+                    "to_path": {"type": "string"},
+                    "update_backlinks": {"type": "boolean", "default": True},
+                },
+                "required": ["from_path", "to_path"],
+            },
+        )
+
+    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        if "from_path" not in args or "to_path" not in args:
+            raise RuntimeError("from_path and to_path required")
+        report = file_ops.rename_file(
+            _client(),
+            args["from_path"],
+            args["to_path"],
+            update_backlinks=bool(args.get("update_backlinks", True)),
+        )
+        return [TextContent(type="text", text=_json(report))]
+
+
+class MoveFileToolHandler(ToolHandler):
+    def __init__(self):
+        super().__init__("obsidian_move_file")
+
+    def get_tool_description(self):
+        return Tool(
+            name=self.name,
+            description="Move a file to a new folder, preserving filename. Updates backlinks by default.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "from_path": {"type": "string"},
+                    "to_folder": {"type": "string"},
+                    "update_backlinks": {"type": "boolean", "default": True},
+                },
+                "required": ["from_path", "to_folder"],
+            },
+        )
+
+    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        if "from_path" not in args or "to_folder" not in args:
+            raise RuntimeError("from_path and to_folder required")
+        report = file_ops.move_file(
+            _client(),
+            args["from_path"],
+            args["to_folder"],
+            update_backlinks=bool(args.get("update_backlinks", True)),
+        )
+        return [TextContent(type="text", text=_json(report))]
+
+
+class BatchRenameToolHandler(ToolHandler):
+    def __init__(self):
+        super().__init__("obsidian_batch_rename")
+
+    def get_tool_description(self):
+        return Tool(
+            name=self.name,
+            description=(
+                "Rename multiple files. Per-item errors are reported but don't abort the batch. "
+                "Backlinks are updated after each rename to keep them consistent as paths shift."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "renames": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from": {"type": "string"},
+                                "to": {"type": "string"},
+                            },
+                            "required": ["from", "to"],
+                        },
+                    },
+                    "update_backlinks": {"type": "boolean", "default": True},
+                },
+                "required": ["renames"],
+            },
+        )
+
+    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        if "renames" not in args:
+            raise RuntimeError("renames required")
+        report = file_ops.batch_rename(
+            _client(),
+            args["renames"],
+            update_backlinks=bool(args.get("update_backlinks", True)),
+        )
+        return [TextContent(type="text", text=_json(report))]
