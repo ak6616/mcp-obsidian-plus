@@ -1,0 +1,26 @@
+[project]
+name = "mcp-obsidian-plus"
+version = "0.3.0"
+description = "Extended MCP server for Obsidian — adds commands, active-file, health-check, link refactoring, tag ops, and more on top of mcp-obsidian"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+ "mcp>=1.1.0",
+ "python-dotenv>=1.0.1",
+ "requests>=2.32.3",
+]
+[[project.authors]]
+name = "ak6616"
+email = "miloszjozefczyk6@gmail.com"
+
+[build-system]
+requires = [ "hatchling",]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.389",
+]
+
+[project.scripts]
+mcp-obsidian-plus = "mcp_obsidian_plus:main"
